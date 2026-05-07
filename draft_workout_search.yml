@@ -1,0 +1,49 @@
+name: Draft Workout Search Digest
+
+# Runs the Google search twice a day (morning + evening US/Pacific) and
+# emails Alberto any new results that haven't been seen before.
+
+on:
+  schedule:
+    # Morning digest: 14:00 UTC = 6:00 AM PT (in PDT) / 7:00 AM PT (in PST)
+    - cron: '0 14 * * *'
+    # Evening digest: 02:00 UTC = 6:00 PM PT (PDT) / 7:00 PM PT (PST)
+    - cron: '0 02 * * *'
+  workflow_dispatch:
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run search + send digest
+        env:
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python search_workouts.py
+
+      - name: Commit seen-URLs cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet seen_urls.json 2>/dev/null; then
+            echo "No new URLs to commit."
+          else
+            git add seen_urls.json
+            git commit -m "track: update seen_urls.json"
+            git push
+          fi
