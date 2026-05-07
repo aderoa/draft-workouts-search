@@ -1,21 +1,22 @@
 """
-Serper.dev → email digest.
+Serper.dev → email digest via Resend.
 
 Runs the configured query against the Serper.dev API (which returns real
 Google search results), filters results to only those NOT seen in previous
 runs (tracked in seen_urls.json), and emails the new results as an HTML
-digest.
+digest via Resend's API (simpler than Gmail SMTP, no app password dance).
 
-Why Serper instead of Google's Custom Search JSON API: Google deprecated
-the "Search the entire web" option for new Programmable Search Engines in
-March 2026 — new engines are limited to 50 specific domains. Serper.dev
-returns true Google search results without that restriction.
+Why Resend instead of Gmail SMTP: Google made Gmail's "app password"
+feature increasingly unreliable — many personal accounts can't enable it
+even with 2FA on. Resend is a modern transactional-email service with a
+generous free tier (3,000 emails/month) and a single API call to send.
 
 Environment variables required:
   SERPER_API_KEY     — API key from serper.dev
-  SMTP_USERNAME      — Gmail address to send FROM
-  SMTP_PASSWORD      — Gmail app password (NOT the regular password)
-  EMAIL_TO           — Recipient email address
+  RESEND_API_KEY     — API key from resend.com
+  EMAIL_FROM         — sender (e.g. workouts@yourdomain.com, OR
+                       onboarding@resend.dev for testing)
+  EMAIL_TO           — recipient
 
 The seen_urls.json file is committed back to the repo by the workflow so
 results are deduplicated across runs.
@@ -23,41 +24,25 @@ results are deduplicated across runs.
 
 import json
 import os
-import smtplib
 import sys
 from datetime import datetime, timezone, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 
 import requests
 
 # ─── Configuration ───────────────────────────────────────────────
 QUERY = 'draft workout -nfl'
-
-# Time-restrict to past day. Serper supports Google's `tbs` parameter
-# directly. 'qdr:d' = past 24 hours, 'qdr:d2' isn't a valid Google value
-# (Google only takes h/d/w/m/y). We'll use 'qdr:d' for last 24h. With
-# twice-daily runs and the dedup cache catching duplicates, missing the
-# 24-hour boundary by a few hours isn't a real risk.
-TIME_RESTRICT = 'qdr:d'
-
-# Number of results to request. Serper returns up to 100 per call. 20 is
-# plenty for the day window — most days have 0-5 actual workout reports.
+TIME_RESTRICT = 'qdr:d'   # Past 24 hours
 NUM_RESULTS = 20
-
-# Localization — request US/English to match what you'd see at google.com
 GOOGLE_LOCALE = 'us'
 GOOGLE_LANG = 'en'
 
 SEEN_FILE = 'seen_urls.json'
-# Cap to keep file size bounded — once we hit this, oldest URLs roll off
 SEEN_CAP = 500
 
 
 # ─── Serper.dev call ─────────────────────────────────────────────
 def search(query: str, api_key: str, num: int = 20) -> list[dict]:
-    """Hit the Serper.dev search API. Returns list of organic-result dicts."""
     url = 'https://google.serper.dev/search'
     headers = {
         'X-API-KEY': api_key,
@@ -78,7 +63,6 @@ def search(query: str, api_key: str, num: int = 20) -> list[dict]:
 
 # ─── Deduplication via JSON file ─────────────────────────────────
 def load_seen() -> dict:
-    """Returns dict: url -> timestamp_first_seen."""
     if not Path(SEEN_FILE).exists():
         return {}
     try:
@@ -89,7 +73,6 @@ def load_seen() -> dict:
 
 
 def save_seen(seen: dict) -> None:
-    """Persist seen URLs. If we exceed SEEN_CAP, drop oldest entries."""
     if len(seen) > SEEN_CAP:
         sorted_items = sorted(seen.items(), key=lambda kv: kv[1])
         seen = dict(sorted_items[-SEEN_CAP:])
@@ -97,9 +80,8 @@ def save_seen(seen: dict) -> None:
         json.dump(seen, f, indent=2, sort_keys=True)
 
 
-# ─── Email rendering + sending ───────────────────────────────────
+# ─── Email rendering ─────────────────────────────────────────────
 def render_html(query: str, items: list[dict], total_seen: int) -> str:
-    """Build the HTML body for the digest email."""
     if not items:
         body = (
             '<p style="color:#666">No new results in the last 24 hours.</p>'
@@ -111,11 +93,8 @@ def render_html(query: str, items: list[dict], total_seen: int) -> str:
             title = (it.get('title') or '(no title)').replace('<', '&lt;')
             url = it.get('link', '#')
             snippet = (it.get('snippet') or '').replace('<', '&lt;')
-            # Serper exposes the source domain via `source` (sometimes); fall
-            # back to parsing it out of the URL.
             display = it.get('source') or ''
             if not display and url:
-                # Cheap host extraction
                 try:
                     display = url.split('/')[2]
                 except IndexError:
@@ -150,27 +129,32 @@ def render_html(query: str, items: list[dict], total_seen: int) -> str:
     '''
 
 
+# ─── Resend API call ─────────────────────────────────────────────
 def send_email(subject: str, html_body: str,
-               smtp_user: str, smtp_pass: str, to_addr: str) -> None:
-    """Send via Gmail SMTP. Uses TLS on port 587."""
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = smtp_user
-    msg['To'] = to_addr
-    msg.attach(MIMEText(html_body, 'html'))
-
-    with smtplib.SMTP('smtp.gmail.com', 587, timeout=30) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
+               api_key: str, from_addr: str, to_addr: str) -> None:
+    """Send via Resend HTTP API. https://resend.com/docs/api-reference/emails/send-email"""
+    url = 'https://api.resend.com/emails'
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    }
+    payload = {
+        'from': from_addr,
+        'to': [to_addr],
+        'subject': subject,
+        'html': html_body,
+    }
+    r = requests.post(url, json=payload, headers=headers, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f'Resend returned {r.status_code}: {r.text[:300]}')
 
 
 # ─── Main flow ───────────────────────────────────────────────────
 def main() -> int:
     required = {
         'SERPER_API_KEY': os.environ.get('SERPER_API_KEY', ''),
-        'SMTP_USERNAME':  os.environ.get('SMTP_USERNAME', ''),
-        'SMTP_PASSWORD':  os.environ.get('SMTP_PASSWORD', ''),
+        'RESEND_API_KEY': os.environ.get('RESEND_API_KEY', ''),
+        'EMAIL_FROM':     os.environ.get('EMAIL_FROM', ''),
         'EMAIL_TO':       os.environ.get('EMAIL_TO', ''),
     }
     missing = [k for k, v in required.items() if not v]
@@ -198,16 +182,14 @@ def main() -> int:
 
     save_seen(seen)
 
-    # Always email so successful runs are visible — empty digests confirm
-    # the workflow is healthy.
     subject_count = f'({len(new_items)} new)' if new_items else '(no new)'
     subject = f'NBA draft workouts {subject_count}'
     html = render_html(QUERY, new_items, len(seen))
 
     try:
         send_email(subject, html,
-                   required['SMTP_USERNAME'],
-                   required['SMTP_PASSWORD'],
+                   required['RESEND_API_KEY'],
+                   required['EMAIL_FROM'],
                    required['EMAIL_TO'])
         print(f'✓ Sent digest to {required["EMAIL_TO"]}')
     except Exception as e:
